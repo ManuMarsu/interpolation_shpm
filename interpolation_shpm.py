@@ -23,7 +23,8 @@
 """
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
+from qgis.PyQt.QtWidgets import QAction, QFileDialog
+from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -170,6 +171,38 @@ class SHPM:
         # will be set False in run()
         self.first_start = True
 
+    def select_rive_gauche(self):
+        filename_rg, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "Shapefile (*.shp)")
+        self.dlg.lineshp_rg.setText(filename_rg)
+        if not filename_rg or filename_rg == "":
+            return
+        riveGauche = QgsVectorLayer(filename_rg, "Rive gauche", 'ogr')
+        if not riveGauche or not riveGauche.isValid():
+            QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_rg.replace('/', os.sep))
+            return
+        QgsProject.instance().addMapLayer(riveGauche)
+
+    def select_rive_droite(self):
+        filename_rd, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "Shapefile (*.shp)")
+        self.dlg.lineshp_rd.setText(filename_rd)
+        if not filename_rd or filename_rd == "":
+            return
+        riveDroite = QgsVectorLayer(filename_rd, "Rive droite", 'ogr')
+        if not riveDroite or not riveDroite.isValid():
+            QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_rd.replace('/', os.sep))
+            return
+        QgsProject.instance().addMapLayer(riveDroite)
+
+    def select_lidar(self):
+        filename_lidar, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "GeoTIFF (*.tif *tiff *TIF *TIFF)")
+        self.dlg.line_raster_lidar.setText(filename_lidar)
+        if not filename_lidar or filename_lidar == "":
+            return
+        lidar_interpolation = QgsRasterLayer(filename_lidar, "SRTM layer name")
+        if not lidar_interpolation or not lidar_interpolation.isValid():
+            QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_lidar.replace('/', os.sep))
+            return
+        QgsProject.instance().addMapLayer(lidar_interpolation)
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
@@ -188,6 +221,9 @@ class SHPM:
         if self.first_start == True:
             self.first_start = False
             self.dlg = SHPMDialog()
+            self.dlg.pushshp_rivg.clicked.connect(self.select_rive_gauche)
+            self.dlg.pushshp_rivd.clicked.connect(self.select_rive_droite)
+            self.dlg.push_raster_lidar.clicked.connect(self.select_lidar)
 
         # show the dialog
         self.dlg.show()
