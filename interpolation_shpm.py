@@ -23,14 +23,17 @@
 """
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction, QFileDialog
-from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
+from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
+from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer, QgsGeometry, QgsPointXY
 
 # Initialize Qt resources from file resources.py
 from .resources import *
+# Import des fonctions spécifiques de l'interpolation
+#from .function import isfloat, interpole, ortho_line, vertex_add, tronque_profil, calcul_planim_sh, tri_pt_profils, creation_profils, profils_amont_aval
 # Import the code for the dialog
 from .interpolation_shpm_dialog import SHPMDialog
 import os.path
+import numpy as np
 
 
 class SHPM:
@@ -67,6 +70,10 @@ class SHPM:
         # Check if plugin was started the first time in current QGIS session
         # Must be set in initGui() to survive plugin reloads
         self.first_start = None
+        self.riveDroite = None
+        self.riveGauche = None
+        self.lidar_interpolation = None
+        self.log = ""
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -171,38 +178,194 @@ class SHPM:
         # will be set False in run()
         self.first_start = True
 
-    def select_rive_gauche(self):
+    def charger_rive_gauche(self):
         filename_rg, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "Shapefile (*.shp)")
         self.dlg.lineshp_rg.setText(filename_rg)
         if not filename_rg or filename_rg == "":
             return
-        riveGauche = QgsVectorLayer(filename_rg, "Rive gauche", 'ogr')
-        if not riveGauche or not riveGauche.isValid():
+        self.riveGauche = QgsVectorLayer(filename_rg, "interpolation_rive_gauche", 'ogr')
+        if not self.riveGauche or not self.riveGauche.isValid():
             QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_rg.replace('/', os.sep))
             return
-        QgsProject.instance().addMapLayer(riveGauche)
+        QgsProject.instance().addMapLayer(self.riveGauche)
 
-    def select_rive_droite(self):
+    def charger_rive_droite(self):
         filename_rd, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "Shapefile (*.shp)")
         self.dlg.lineshp_rd.setText(filename_rd)
         if not filename_rd or filename_rd == "":
             return
-        riveDroite = QgsVectorLayer(filename_rd, "Rive droite", 'ogr')
-        if not riveDroite or not riveDroite.isValid():
+        self.riveDroite = QgsVectorLayer(filename_rd, "interpolation_rive_droite", 'ogr')
+        if not self.riveDroite or not self.riveDroite.isValid():
             QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_rd.replace('/', os.sep))
             return
-        QgsProject.instance().addMapLayer(riveDroite)
+        QgsProject.instance().addMapLayer(self.riveDroite)
 
-    def select_lidar(self):
+    def charger_lidar(self):
         filename_lidar, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "GeoTIFF (*.tif *tiff *TIF *TIFF)")
         self.dlg.line_raster_lidar.setText(filename_lidar)
         if not filename_lidar or filename_lidar == "":
             return
-        lidar_interpolation = QgsRasterLayer(filename_lidar, "SRTM layer name")
-        if not lidar_interpolation or not lidar_interpolation.isValid():
+        self.lidar_interpolation = QgsRasterLayer(filename_lidar, "interpolation_lidar")
+        if not self.lidar_interpolation or not self.lidar_interpolation.isValid():
             QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_lidar.replace('/', os.sep))
             return
-        QgsProject.instance().addMapLayer(lidar_interpolation)
+        QgsProject.instance().addMapLayer(self.lidar_interpolation)
+
+    def calcul_interpolation(self):
+
+        if not self.riveGauche or not self.riveGauche.isValid() or not self.riveDroite or not self.riveDroite.isValid() or not self.lidar_interpolation or not self.lidar_interpolation.isValid():
+            donnees_entrees_ok = False
+            QMessageBox.warning(self.iface.mainWindow(), "Echec", "Une des données d'entrée (rive gauche, rive droite, LIDAR) est manquante")
+        else:
+            # Conformité des données rentrées par l'utilisateur
+            maillage = int(self.dlg.line_maillage.text())
+            largeur_vallee = int(self.dlg.line_largeur_vallee.text())
+            donnees_entrees_ok = True and (maillage == -1 or maillage > 0) and (largeur_vallee > 0)
+            # Initialisation des variables
+            couche_profils = QgsProject.instance().mapLayersByName('profiles')[0]
+            couche_branche = QgsProject.instance().mapLayersByName('branchs')[0]
+            profils_source = [] # Liste de dictionnaires représentant chaque profil source :
+                                    # prof_sourc_elem['nom'] : nom du profil
+                                    # prof_sourc_elem['dist_cote'] = [x_tronque, z_tronque]
+                                        # x_tronque : liste des distances (abscisse curviligne sur le profil)
+                                        # z_tronque : liste des cotes correspondantes aux distances
+                                    # prof_sourc_elem['z_min'] : cote min du profil
+                                    # prof_sourc_elem['z_max'] : cote max du profil
+                                    # prof_sourc_elem['absc'] : abscisse du profil sur la branche
+                                    # prof_sourc_elem['mat_planim'] : planimétrage du profil sous la forme [section hydraulique]
+            abs_dernier_profil = 1000000
+            ind_dernier_profil = 0
+            ind_premier_profil = 0
+            abs_premier_profil = 0
+            planimetrage = 0.1 # Simple initialisation de la variable, la valeur est récupérée pour la branche concernée
+            z_min = 8000
+            z_max = 0
+            branchesConcernees = []
+            nouveaux_profils = {}
+            nouveaux_profils['profils'] = [] # Liste de QgsFeature
+            nouveaux_profils['inters_br'] = [] # Liste de QgsPoint (intersection du profil avec la branche)
+            nouveaux_profils['absc'] = [] # Liste de float (abscisse du profil)
+            nouveaux_profils['mnt'] = [] # Liste de dictionnaires {'rg': 0, 'rd': 0}
+            nouveaux_profils['geom'] = [] # liste de dictionnaires {'miroir': 0, 'x_coeff_a': 0, 'x_coeff_b': 0, 'y_coeff_a': 0, 'y_coeff_b': 0} - coefficients pour positionner en x,y les points sur le profil à partir de la distance au début du profil : (x = d * x_coeff_a + x_coeff_b, d * y_coeff_a + y_coeff_b)
+            nouveaux_profils['mat_planim'] = [] # Liste de tableaux numpy (planimétrage de la section hydraulique du profil)
+        if donnees_entrees_ok:
+            riveGauche = self.riveGauche
+            riveDroite = self.riveDroite
+            self.add_log("1- Identification des profils qui intersectent rive gauche et rive droite et ajout de vertex aux intersections avec les rives")
+            if riveGauche.isSpatial() and riveDroite.isSpatial() and couche_profils.isSpatial():
+                # Conversion des géométries de la rive droite en entités simples
+                for feature in riveDroite.getFeatures():
+                    geom = feature.geometry()
+                    succes = QgsGeometry.convertToSingleType(geom) #succes est un booléen
+                    if not succes:
+                        self.add_log("Impossible de convertir en géométrie simple la couche rive droite")
+                    geom_rd = geom
+                    self.add_log("Une entité trouvée pour la couche rive droite")
+                # Conversion des géométries de la rive gauche en entités simples
+                for feature in riveGauche.getFeatures():
+                    geom = feature.geometry()
+                    succes = QgsGeometry.convertToSingleType(geom)  #succes est un booléen
+                    if not succes:
+                        self.add_log("Impossible de convertir en géométrie simple la couche rive gauche")
+                    geom_rg = geom
+                    self.add_log("Une entité trouvée pour la couche rive droite")
+                # Identification des profils "sources" et ajout de vertex aux intersections avec les rives
+                couche_profils.startEditing()
+                for profil in couche_profils.getFeatures():
+                    inter_rd = profil.geometry().intersection(geom_rd)
+                    inter_rg = profil.geometry().intersection(geom_rg)
+                    #if not inter_rd.isEmpty() and not inter_rg.isEmpty():
+                    if profil.geometry().intersects(geom_rd) and profil.geometry().intersects(geom_rg):
+                        self.add_log(profil['name'] + " ----- Abscisse : " + str(profil['abscissa']))  
+                        prof_sourc_elem = {}
+                        if inter_rg.wkbType() == "Point":
+                            self.add_log("type point")
+                        elif inter_rg.wkbType() == "Multipoint":
+                            self.add_log("type multipoint")
+                        elif inter_rg.wkbType() == "MultiLineString":
+                            self.add_log("type multilinestring")
+                        elif inter_rg.wkbType() == "GeometryCollection":
+                            self.add_log("type geometry collection")
+                        else:
+                            self.add_log(str(inter_rg.wkbType()))
+                        if inter_rg.isMultipart():
+                            self.add_log("Plusieurs intersections rive gauche")
+                        if inter_rd.isMultipart():
+                            self.add_log("Plusieurs intersections rive droite")
+                        profil.setGeometry(self.vertex_add(profil.geometry(), couche_profils, profil.id(), inter_rd.asPoint().x(), inter_rd.asPoint().y(), tol=0.015))
+                        profil.setGeometry(self.vertex_add(profil.geometry(), couche_profils, profil.id(), inter_rg.asPoint().x(), inter_rg.asPoint().y(), tol=0.015))
+                        self.add_log("Vertex ajoutés aux intersections rive droite et rive gauche")
+                        # Calcul de la distance entre l'origine du profil et l'intersection avec rive droite / respectivement rive gauche
+                        p, indV_inter_rd, bv, av, d = profil.geometry().closestVertex(inter_rd.asPoint())
+                        dist_inter_rd = profil.geometry().distanceToVertex(indV_inter_rd)
+                        p, indV_inter_rg, bv, av, d = profil.geometry().closestVertex(inter_rg.asPoint())
+                        dist_inter_rg = profil.geometry().distanceToVertex(indV_inter_rg)
+                        self.add_log("Distance à l'intersection RG : " + str(dist_inter_rg))
+                        self.add_log("Distance à l'intersection RD : " + str(dist_inter_rd))
+                        if len(profil.attribute("x")) > 0 and len(profil.attribute("z")) > 0:
+                            x_str = profil.attribute("x").split(" ")
+                            z_str = profil.attribute("z").split(" ")
+                            self.add_log("Colonne x : " + str(len(x_str)) + " points")
+                            self.add_log("Colonne z : " + str(len(z_str)) + " points")
+                            x_tronque, z_tronque = self.tronque_profil(x_str, z_str, dist_inter_rg, dist_inter_rd)
+                            prof_sourc_elem['dist_cote'] = [x_tronque, z_tronque]
+                            prof_sourc_elem['z_min'] = min(z_tronque)
+                            prof_sourc_elem['z_max'] = max(z_tronque)
+                            self.add_log("Colonne x (tronquée): " + str(len(x_tronque)) + " points ")
+                            self.add_log("Colonne z (tronquée): " + str(len(z_tronque)) + " points - min = " + str(prof_sourc_elem['z_min']) + " - max = " + str(prof_sourc_elem['z_max']))
+                            if prof_sourc_elem['z_min'] < z_min:
+                                z_min = prof_sourc_elem['z_min']
+                            if prof_sourc_elem['z_max'] > z_max:
+                                z_max = prof_sourc_elem['z_max']
+                        prof_sourc_elem['absc'] = profil['abscissa']
+                        prof_sourc_elem['nom'] = profil['name']
+                        profils_source.append(prof_sourc_elem)
+                        self.add_log("\n")
+                couche_profils.commitChanges()
+                # Identification de la plage des abscisses des profils identifiés
+                abs_dernier_profil = 0
+                if len(profils_source) > 0:
+                    abs_premier_profil = profils_source[0]['absc']
+                    for indice, profil_source in enumerate(profils_source):
+                        if profil_source['absc'] > abs_dernier_profil:
+                            abs_dernier_profil = profil_source['absc']
+                            ind_dernier_profil = indice
+                        if profil_source['absc'] < abs_premier_profil:
+                            abs_premier_profil = profil_source['absc']
+                            ind_premier_profil = indice
+                else:
+                    abs_premier_profil = 0
+                self.add_log("Identification des profils sources terminée : " + str(len(profils_source)) + " profils trouvés (abcisses entre : " + str(abs_premier_profil) + " et : " + str(abs_dernier_profil) + "\n")
+            else:
+                self.add_log("Une des couches rive droite / rive gauche / profiles n'est pas une couche spatiale")
+            
+            # 2- Identification des principales caractéristiques des branches concernées
+            self.add_log("2- Identification des principales caractéristiques des branches concernées")
+            features = couche_branche.getFeatures()
+            for feature in features:
+                branche_concernee = False
+                for profil_source in profils_source:
+                    if profil_source['absc'] > feature['zoneabsstart'] and profil_source['absc'] < feature['zoneabsend']:
+                        branche_concernee = True
+                if branche_concernee:
+                    cur_branch = {}
+                    cur_branch['abs_debut'] = feature['zoneabsstart']
+                    cur_branch['abs_fin'] = feature['zoneabsend']
+                    self.add_log("Branche numéro : " + str(feature['branch']))
+                    self.add_log("Abscisse début : " + str(feature['zoneabsstart']))
+                    self.add_log("Abscisse fin : " + str(feature['zoneabsend']))
+                    self.add_log("Maillage : " + str(feature['mesh']))
+                    self.add_log("Planimétrage : " + str(feature['planim']) + "\n")
+                    if maillage == -1 or feature['mesh'] < maillage:
+                        maillage = feature['mesh']
+                    if feature['planim'] < planimetrage:
+                        planimetrage = feature['planim']
+                    cur_branch['axe_branche'] = feature.geometry()
+                    branchesConcernees.append(cur_branch)
+
+    def add_log(self, texte):
+        self.log += texte + "\n"
+        self.dlg.text_log.setText(self.log)
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
@@ -221,9 +384,12 @@ class SHPM:
         if self.first_start == True:
             self.first_start = False
             self.dlg = SHPMDialog()
-            self.dlg.pushshp_rivg.clicked.connect(self.select_rive_gauche)
-            self.dlg.pushshp_rivd.clicked.connect(self.select_rive_droite)
-            self.dlg.push_raster_lidar.clicked.connect(self.select_lidar)
+            self.dlg.pushshp_rivg.clicked.connect(self.charger_rive_gauche)
+            self.dlg.pushshp_rivd.clicked.connect(self.charger_rive_droite)
+            self.dlg.push_raster_lidar.clicked.connect(self.charger_lidar)
+            self.dlg.push_calcul_interpolation.clicked.connect(self.calcul_interpolation)
+
+
 
         # show the dialog
         self.dlg.show()
@@ -234,3 +400,208 @@ class SHPM:
             # Do something useful here - delete the line containing pass and
             # substitute with your code.
             pass
+    
+    
+    def ortho_line(self, inters_prec, inters_suiv, inters_courant, largeur_vallee):
+        x1 = inters_prec.x()
+        y1 = inters_prec.y()
+        x2 = inters_suiv.x()
+        y2 = inters_suiv.y()
+        x3 = inters_courant.x()
+        y3 = inters_courant.y()
+        # y = coeff_A * x + coeff_B est l'équation de la droite perpendiculaire à X1-X2 passant par X3
+        coeff_A = (x2 - x1) / (y1 - y2)
+        coeff_B = y3 - x3 * ((x2 - x1) / (y1 - y2))
+        # linestart et lineend sont les 2 extrémités de la polyligne perpendiculaire à X1-X2 passant par X3
+        if coeff_A < -1:
+            y_start = y3 + largeur_vallee
+            x_start = (y_start - coeff_B) / coeff_A
+            y_end = y3 - largeur_vallee
+            x_end = (y_end - coeff_B) / coeff_A
+        elif coeff_A <= 0 and coeff_A >= -1:
+            x_start = x3 + largeur_vallee
+            y_start = coeff_A *  x_start + coeff_B
+            x_end = x3 - largeur_vallee
+            y_end = coeff_A *  x_end + coeff_B
+        elif coeff_A > 0 and coeff_A <= 1:
+            x_start = x3 + largeur_vallee
+            y_start = coeff_A *  x_start + coeff_B
+            x_end = x3 - largeur_vallee
+            y_end = coeff_A *  x_end + coeff_B
+        elif coeff_A > 1:
+            y_start = y3 + largeur_vallee
+            x_start = (y_start - coeff_B) / coeff_A
+            y_end = y3 - largeur_vallee
+            x_end = (y_end - coeff_B) / coeff_A
+        return x_start, y_start, x_end, y_end
+
+    def vertex_add(self, geom, couche, feat_id, x, y, tol=0.01):
+        p1, at, b1, after, d1 = geom.closestVertex(QgsPointXY(x, y))
+        dist, p2, to, _ = geom.closestSegmentWithContext(QgsPointXY(x, y))
+        if at == 0:
+            if dist < tol:
+                # insert into first segment
+                couche.insertVertex(x, y, feat_id, after)
+                geom.insertVertex(x, y, after)
+            else:
+                # insert before first vertex
+                couche.insertVertex(x, y, feat_id, 0)
+                geom.insertVertex(x, y, 0)
+        elif after == -1:
+            if dist < tol:
+                # insert after last vertex
+                couche.insertVertex(x, y, feat_id, at)
+                geom.insertVertex(x, y, at)
+            else:
+                # insert into last segment
+                couche.insertVertex(x, y, feat_id, at - 1)
+                geom.insertVertex(x, y, at - 1)
+        return geom
+
+    def tronque_profil(self, x_str, z_str, dist_rg, dist_rd):
+        flag_rg = False
+        flag_rd = False
+        x_tronque = []
+        z_tronque = []
+        for i, xx in enumerate(x_str):
+            x = float(xx)
+            if x < dist_rg:
+                pass
+            elif x >= dist_rg and x <= dist_rd:
+                if x == dist_rg or flag_rg:
+                    x_tronque.append(x)
+                    z_tronque.append(float(z_str[i]))
+                    flag_rg = True
+                elif x == dist_rd:
+                    x_tronque.append(x)
+                    z_tronque.append(float(z_str[i]))
+                    flag_rd = True
+                else:
+                    x_tronque.append(dist_rg)
+                    z_tronque.append((dist_rg - float(x_str[i - 1])) * (float(z_str[i]) - float(z_str[i - 1])) / (x - float(x_str[i - 1])) + float(z_str[i - 1]))
+                    flag_rg = True
+            elif x > dist_rd and not flag_rd:
+                x_tronque.append(dist_rd)
+                z_tronque.append((dist_rd - float(x_str[i - 1])) * (float(z_str[i]) - float(z_str[i - 1])) / (x - float(x_str[i - 1])) + float(z_str[i - 1]))
+                flag_rd = True
+        return x_tronque, z_tronque
+
+    def calcul_planim_sh(ref_plani, x_z):
+        # Il faut d'abord s'assurer que x_z est trié dans l'ordre croissant
+        ref_sh = np.zeros(np.shape(ref_plani)[0])
+        if np.shape(ref_plani)[0] > 1:
+            pas_plani = ref_plani[1] - ref_plani[0]
+            for i in range(len(x_z) - 1):
+                d1 = x_z[i][0] # distance
+                z1 = x_z[i][1] # cote
+                d2 = x_z[i+1][0]
+                z2 = x_z[i+1][1]
+                en_eau = False
+                for ip, p in enumerate(ref_plani):
+                    sh_cur = 0
+                    if en_eau:
+                        sh_cur = (d2 - d1) * pas_plani
+                    elif (p + pas_plani) <= z1 and (p + pas_plani) <= z2:
+                        sh_cur = 0
+                    else:
+                        sh_cur = (p + pas_plani - max(z1, z2)) * (d2 - d1) + (math.fabs(z2 - z1) * (d2 - d1) * 0.5)
+                        en_eau = True
+                    ref_sh[ip] += round(sh_cur * 1000) / 1000
+        ref_sh2 = np.around(ref_sh, decimals=3)
+        return ref_sh2
+
+    def tri_pt_profils(self, x_z_t, ordre_croissant):
+        left = []
+        equal = []
+        right = []
+        if ordre_croissant:
+            if len(x_z_t) > 1:
+                pivot = x_z_t[0][0]
+                for i, x in enumerate(x_z_t):
+                    if x[0] < pivot:
+                        left.append([x_z_t[i][0], x_z_t[i][1]])
+                    elif x[0] == pivot:
+                        equal.append([x_z_t[i][0], x_z_t[i][1]])
+                    elif x[0] > pivot:
+                        right.append([x_z_t[i][0], x_z_t[i][1]])
+                return self.tri_pt_profils(left, ordre_croissant) + equal + self.tri_pt_profils(right, ordre_croissant)
+            else:
+                return x_z_t
+        else: # Ordre décroissant
+            if len(x_z_t) > 1:
+                pivot = x_z_t[0][0]
+                for i, x in enumerate(x_z_t):
+                    if x[0] > pivot:
+                        left.append([x_z_t[i][0], x_z_t[i][1]])
+                    elif x[0] == pivot:
+                        equal.append([x_z_t[i][0], x_z_t[i][1]])
+                    elif x[0] < pivot:
+                        right.append([x_z_t[i][0], x_z_t[i][1]])
+                return self.tri_pt_profils(left, ordre_croissant) + equal + self.tri_pt_profils(right, ordre_croissant)
+            else:
+                return x_z_t
+
+    def creation_profils(self, ref_plani, planim, dist_centre_profil, max_rg, max_rd): 
+        # ref_plani est le tableau des altitudes planimétrées
+        # planim est un tableau numpy avec le planimétrage du profil à créer
+        # dist_centre_profil donne la valeur sur laquelle centrer le profil à créer
+        x_gauche = ""
+        z_gauche = ""
+        x_droite = ""
+        z_droite = ""
+        x_z_gauche = []
+        x_z_droite = []
+        nbr_pas = len(ref_plani)
+        pas = ref_plani[1] - ref_plani[0]
+        miroir_p = planim[nbr_pas - 1] / pas
+        for indice in range(nbr_pas):
+            if indice == 0:
+                esp = ""
+            else:
+                esp = " "
+            i = nbr_pas - indice - 1
+            zg = min(ref_plani[i], max_rg)
+            zd = min(ref_plani[i], max_rd)
+            miroir = (2 * planim[i]) / (3 * pas) + (miroir_p / 3)
+            miroir_p = miroir
+            if miroir > 0 and planim[i] > 0:
+                if ref_plani[i] <= max_rg:
+                    x_gauche += str(dist_centre_profil - (miroir / 2)) + " "
+                    z_gauche += str(zg) + " "
+                    x_z_gauche.append([dist_centre_profil - (miroir / 2), zg])
+                if ref_plani[i] <= max_rd:
+                    x_droite = str(dist_centre_profil + (miroir / 2)) + esp + x_droite
+                    z_droite = str(zd) + esp + z_droite
+                    x_z_droite = [[dist_centre_profil + (miroir / 2), zd]] + x_z_droite
+            else:
+                break
+        return x_gauche + x_droite, z_gauche + z_droite, x_z_gauche + x_z_droite
+
+    def tri_profils(self, profils_source):
+        left = []
+        equal = []
+        right = []
+        if len(profils_source) > 1:
+            pivot = profils_source[0]['absc']
+            for profil in profils_source:
+                if profil['absc'] < pivot:
+                    left.append(profil)
+                elif profil['absc'] == pivot:
+                    equal.append(profil)
+                elif profil['absc'] > pivot:
+                    right.append(profil)
+            return self.tri_profils(left) + equal + self.tri_profils(right)
+        else:
+            return profils_source
+
+    def profils_amont_aval(self, abscisse, profils_source):
+        profils_source_tries = self.tri_profils(profils_source)
+        profil_amont = profils_source[0]
+        profil_aval = profils_source[1]
+        trouve = False
+        for indice in range(len(profils_source_tries) - 1):
+            if abscisse >= profils_source_tries[indice]['absc'] and abscisse <= profils_source_tries[indice + 1]['absc']:
+                profil_amont = profils_source_tries[indice]
+                profil_aval = profils_source_tries[indice + 1]
+                trouve = True
+        return trouve, profil_amont, profil_aval
