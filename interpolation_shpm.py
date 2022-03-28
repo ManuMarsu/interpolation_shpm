@@ -24,7 +24,7 @@
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
-from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer, QgsGeometry, QgsPointXY
+from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer, QgsGeometry, QgsPointXY, QgsRaster, QgsFeature
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -34,6 +34,7 @@ from .resources import *
 from .interpolation_shpm_dialog import SHPMDialog
 import os.path
 import numpy as np
+import math
 
 
 class SHPM:
@@ -73,6 +74,7 @@ class SHPM:
         self.riveDroite = None
         self.riveGauche = None
         self.lidar_interpolation = None
+        self.semis_interp = None
         self.log = ""
 
     # noinspection PyMethodMayBeStatic
@@ -189,6 +191,17 @@ class SHPM:
             return
         QgsProject.instance().addMapLayer(self.riveGauche)
 
+    def charger_semis_interp(self):
+        filename_semis_interp, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "Shapefile (*.shp)")
+        self.dlg.lineshp_semi_interp.setText(filename_semis_interp)
+        if not filename_semis_interp or filename_semis_interp == "":
+            return
+        self.semis_interp = QgsVectorLayer(filename_semis_interp, "semis_interp_lit_mineur", 'ogr')
+        if not self.semis_interp or not self.semis_interp.isValid():
+            QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_semis_interp.replace('/', os.sep))
+            return
+        QgsProject.instance().addMapLayer(self.semis_interp)
+
     def charger_rive_droite(self):
         filename_rd, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "Shapefile (*.shp)")
         self.dlg.lineshp_rd.setText(filename_rd)
@@ -199,6 +212,7 @@ class SHPM:
             QMessageBox.warning(self.iface.mainWindow(), "Echec", "Le fichier \"%s\" n’est pas reconnu par QGis."% filename_rd.replace('/', os.sep))
             return
         QgsProject.instance().addMapLayer(self.riveDroite)
+
 
     def charger_lidar(self):
         filename_lidar, _filter = QFileDialog.getOpenFileName(self.dlg, "Select output file", "", "GeoTIFF (*.tif *tiff *TIF *TIFF)")
@@ -221,9 +235,11 @@ class SHPM:
             maillage = int(self.dlg.line_maillage.text())
             largeur_vallee = int(self.dlg.line_largeur_vallee.text())
             donnees_entrees_ok = True and (maillage == -1 or maillage > 0) and (largeur_vallee > 0)
+            decalage = 0 # Valeur {test - principe non satisfaisant dans l'absolu} compensatrice de l'écart de calcul des abscisses entre la fonction interpolate() et le reste du plugin
             # Initialisation des variables
             couche_profils = QgsProject.instance().mapLayersByName('profiles')[0]
             couche_branche = QgsProject.instance().mapLayersByName('branchs')[0]
+            prefixe_nom_profil = 'nods_'
             profils_source = [] # Liste de dictionnaires représentant chaque profil source :
                                     # prof_sourc_elem['nom'] : nom du profil
                                     # prof_sourc_elem['dist_cote'] = [x_tronque, z_tronque]
@@ -251,6 +267,9 @@ class SHPM:
         if donnees_entrees_ok:
             riveGauche = self.riveGauche
             riveDroite = self.riveDroite
+
+            # *************************************************************************************************************************
+            # 1- Identification des profils qui intersectent rive gauche et rive droite et ajout de vertex aux intersections avec les rives
             self.add_log("1- Identification des profils qui intersectent rive gauche et rive droite et ajout de vertex aux intersections avec les rives")
             if riveGauche.isSpatial() and riveDroite.isSpatial() and couche_profils.isSpatial():
                 # Conversion des géométries de la rive droite en entités simples
@@ -272,6 +291,7 @@ class SHPM:
                 # Identification des profils "sources" et ajout de vertex aux intersections avec les rives
                 couche_profils.startEditing()
                 for profil in couche_profils.getFeatures():
+                    profil.setGeometry(profil.geometry().densifyByDistance(5))
                     inter_rd = profil.geometry().intersection(geom_rd)
                     inter_rg = profil.geometry().intersection(geom_rg)
                     #if not inter_rd.isEmpty() and not inter_rg.isEmpty():
@@ -339,6 +359,7 @@ class SHPM:
             else:
                 self.add_log("Une des couches rive droite / rive gauche / profiles n'est pas une couche spatiale")
             
+            # *************************************************************************************************************************
             # 2- Identification des principales caractéristiques des branches concernées
             self.add_log("2- Identification des principales caractéristiques des branches concernées")
             features = couche_branche.getFeatures()
@@ -362,6 +383,250 @@ class SHPM:
                         planimetrage = feature['planim']
                     cur_branch['axe_branche'] = feature.geometry()
                     branchesConcernees.append(cur_branch)
+            
+            # *************************************************************************************************************************
+            # 3- Calcul des points d'intersection des profils interpolés avec les branches
+            if len(branchesConcernees) == 0:
+                self.add_log("Aucune branche au droit de la délimitation des berges du lit mineur")
+            else: 
+                self.add_log("3- Calcul des points d'intersection des profils interpolés avec la ou les branches")
+                liste_intersec_profils_intermediaires = []
+                abscisses_nouveaux_profils = []
+                for branche in branchesConcernees:
+                    if branche['abs_debut'] <= abs_premier_profil and abs_premier_profil <= branche['abs_fin']:
+                        axe_branche = branche['axe_branche']
+                        point = axe_branche.interpolate(abs_premier_profil - branche['abs_debut'] - decalage)
+                        liste_intersec_profils_intermediaires.append(point)
+                abscisses_nouveaux_profils.append(abs_premier_profil)
+                for pos_curv_branch in np.arange(abs_premier_profil, abs_dernier_profil, maillage):
+                    for branche in branchesConcernees:
+                        #self.add_log(str(branche['abs_debut']) + " - " + str(pos_curv_branch) + " - " + str(branche['abs_fin']))
+                        if branche['abs_debut'] <= pos_curv_branch and pos_curv_branch <= branche['abs_fin']:
+                            axe_branche = branche['axe_branche']
+                            point = axe_branche.interpolate(pos_curv_branch - branche['abs_debut'] - decalage)
+                            liste_intersec_profils_intermediaires.append(point)
+                    abscisses_nouveaux_profils.append(pos_curv_branch)
+                for branche in branchesConcernees:
+                    if branche['abs_debut'] <= abs_dernier_profil and abs_dernier_profil <= branche['abs_fin']:
+                        axe_branche = branche['axe_branche']
+                        point = axe_branche.interpolate(abs_dernier_profil - branche['abs_debut'] - decalage)
+                        liste_intersec_profils_intermediaires.append(point)
+                abscisses_nouveaux_profils.append(abs_dernier_profil)
+                self.add_log(str(len(liste_intersec_profils_intermediaires) - 2) + " nouveaux profils à créer")
+            
+            # *************************************************************************************************************************
+            # 4- Création des profils dans la couche profiles
+            self.add_log("4- Création des profils dans la couche profiles")
+            couche_profils.startEditing()
+            if len(liste_intersec_profils_intermediaires) > 3:
+                # Préparation de la géométrie de chaque profil interpolé (orthogonale à la branche, sur toute la largeur de la vallée)
+                for ind_profil in range(len(liste_intersec_profils_intermediaires) - 2):
+                    inters_prec = liste_intersec_profils_intermediaires[ind_profil].asPoint()
+                    inters_suiv = liste_intersec_profils_intermediaires[ind_profil + 2].asPoint()
+                    inters_courant = liste_intersec_profils_intermediaires[ind_profil + 1].asPoint()
+                    x_start, y_start, x_end, y_end = self.ortho_line(inters_prec, inters_suiv, inters_courant, largeur_vallee)
+                    new_feature = QgsFeature(couche_profils.fields())
+                    new_feature.setAttribute('name', prefixe_nom_profil + str(ind_profil))
+                    new_feature.setAttribute('active', True)
+                    new_feature.setAttribute('struct', 0)
+                    new_feature.setGeometry(QgsGeometry.fromPolylineXY([QgsPointXY(x_start, y_start), QgsPointXY(x_end, y_end)]))
+                    nouveaux_profils['profils'].append(new_feature)
+                    nouveaux_profils['inters_br'].append(inters_courant)
+                    nouveaux_profils['absc'].append(abscisses_nouveaux_profils[ind_profil])
+                    nouveaux_profils['mnt'].append({'rg': 0, 'rd': 0})
+                    nouveaux_profils['geom'].append({'miroir': 0, 'x_coeff_a': (x_end - x_start) / new_feature.geometry().length(), 'x_coeff_b': x_start, 'y_coeff_a': (y_end - y_start) / new_feature.geometry().length(), 'y_coeff_b': y_start})
+                self.add_log("Géométries non tronquées préparées")
+
+                # Troncature des profils au niveau des rives droite et gauche
+                raster = QgsProject.instance().mapLayersByName("interpolation_lidar")[0]
+                if isinstance(raster, QgsRasterLayer):
+                    raster_provider = raster.dataProvider()
+                    for index, profil_etendu in enumerate(nouveaux_profils['profils']):
+                        self.add_log(profil_etendu['name'])
+
+                        #start_line_gauche = geom_rg.nearestPoint(profil_etendu.geometry())
+                        #start_line_droite = geom_rd.nearestPoint(profil_etendu.geometry())
+
+                        #start_line_gauche = geom_rg.nearestPoint(nouveaux_profils['profils'][index].geometry())
+                        #start_line_droite = geom_rd.nearestPoint(nouveaux_profils['profils'][index].geometry())
+
+                        start_line_gauche = profil_etendu.geometry().intersection(geom_rg)
+                        #self.add_log(str(profil_etendu.geometry()))
+                        #self.add_log(str(geom_rg))
+                        #self.add_log("Intersection rive gauche : " + str(start_line_gauche.type()))
+                        start_line_droite = profil_etendu.geometry().intersection(geom_rd)
+                        #self.add_log(str(geom_rd))
+                        #self.add_log(str(start_line_droite))
+                        #self.add_log("Intersection rive droite : " + str(start_line_droite.type()))
+                        if start_line_gauche.isMultipart():
+                            multigeom = start_line_gauche.asGeometryCollection()
+                            plus_courte_distance = 2 * largeur_vallee
+                            for element in multigeom:
+                                intersec_branche = nouveaux_profils['inters_br'][index]
+                                distance_element = element.asPoint().distance(intersec_branche.x(), intersec_branche.y())
+                                if distance_element <= plus_courte_distance:
+                                    start_line_gauche = element
+                                    plus_courte_distance = distance_element
+                        elif start_line_gauche.isEmpty():
+                            self.add_log("Intersection vide avec la rive gauche")
+                            start_line_gauche = geom_rg.nearestPoint(nouveaux_profils['profils'][index].geometry())
+                        if start_line_droite.isMultipart():
+                            multigeom = start_line_droite.asGeometryCollection()
+                            plus_courte_distance = 2 * largeur_vallee
+                            for element in multigeom:
+                                intersec_branche = nouveaux_profils['inters_br'][index]
+                                distance_element = element.asPoint().distance(intersec_branche.x(), intersec_branche.y())
+                                if distance_element <= plus_courte_distance:
+                                    start_line_droite = element
+                                    plus_courte_distance = distance_element
+                        elif start_line_droite.isEmpty():
+                            self.add_log("Intersection vide avec la rive droite")
+                            start_line_droite = geom_rd.nearestPoint(nouveaux_profils['profils'][index].geometry())
+                        
+                        # Identification des valeurs du MNT au niveau des rives
+                        ident = raster_provider.identify(start_line_gauche.asPoint(), QgsRaster.IdentifyFormatValue).results()
+                        if ident[1]:
+                            nouveaux_profils['mnt'][index]['rg'] = ident[1]
+                            if ident[1] > z_max:
+                                z_max = ident[1]
+                        ident = raster_provider.identify(start_line_droite.asPoint(), QgsRaster.IdentifyFormatValue).results()
+                        if ident[1]:
+                            nouveaux_profils['mnt'][index]['rd'] = ident[1]
+                            if ident[1] > z_max:
+                                z_max = ident[1]
+                        
+                        # Création de la géométrie tronquée aux rives
+                        profil_etendu.setGeometry(QgsGeometry.fromPolylineXY([start_line_gauche.asPoint(), start_line_droite.asPoint()]))
+                        nouveaux_profils['geom'][index]['miroir'] = profil_etendu.geometry().length()
+                    self.add_log("Géométries tronquées préparées\n")
+                else:
+                    self.add_log("La couche LIDAR fournie n'est pas une couche raster valide\n")
+            
+            # A ce stade, on a construit la géométrie entre rives de chacun des profils interpolés et on connait leurs caractéristiques respectives :
+            # - nouveaux_profils['geom'][index]['miroir'] : largeur au miroir
+            # - nouveaux_profils['geom'][index]['x_coeff_a', 'x_coeff_b', 'y_coeff_a', 'y_coeff_b'] : coefficients pour positionner en x,y les points sur le profil à partir de la distance au début du profil : (x = d * x_coeff_a + x_coeff_b, d * y_coeff_a + y_coeff_b)
+            # - nouveaux_profils['mnt'][index]['rg / rd'] : valeur du lidar aux extrémités du profil
+            # - nouveaux_profils['inters_br'][index] : QgsPoint de l'intersection avec la branche
+            # - nouveaux_profils['absc'][index] : abscisse curviligne du profil le long de la branche
+            # - nouveaux_profils['profils'][index] : QgsFeature avec les données remplies, sauf attributs 'x' et 'z'
+
+            # prof_sourc : Liste de dictionnaires représentant chaque profil source :
+                # prof_sourc_elem['dist_cote'] = [x_tronque, z_tronque]
+                    # x_tronque : liste des distances (abscisse curviligne sur le profil)
+                    # z_tronque : liste des cotes correspondantes aux distances
+                # prof_sourc_elem['z_min'] : cote min du profil
+                # prof_sourc_elem['z_max'] : cote max du profil
+                # prof_sourc_elem['absc'] : abscisse du profil sur la branche
+                # prof_sourc_elem['mat_planim'] : planimétrage du profil sous la forme [zinf, section hydraulique]
+                # prof_sourc_elem['nom'] : nom du profil
+
+            # *************************************************************************************************************************
+            # 5- Calcul du planimétrage de chaque profil source
+            if len(liste_intersec_profils_intermediaires) > 3:
+                self.add_log("5- Calcul du planimétrage de chaque profil source")
+                ref_plani = np.arange(z_min, z_max + planimetrage, planimetrage)
+                for iprof, prof_sourc_elem in enumerate(profils_source):
+                    #self.add_log(prof_sourc_elem['nom'])
+                    #self.add_log("Avant complétude : " + str(prof_sourc_elem['dist_cote'][0]) + "\n" + str(prof_sourc_elem['dist_cote'][1]))
+                    # On parcourt chacun des points du profil et on regarde à chaque fois s'il y a lieu d'insérer un point du planimétrage
+                    x_z = []
+                    self.add_log("Calcul du profil source : '" + prof_sourc_elem['nom'] + "' : ")
+                    self.add_log(str(prof_sourc_elem['dist_cote'][0]))
+                    self.add_log(str(prof_sourc_elem['dist_cote'][1]))
+
+                    for absc in range(len((prof_sourc_elem['dist_cote'][0])) - 1):
+                        d1 = prof_sourc_elem['dist_cote'][0][absc] # distance
+                        z1 = prof_sourc_elem['dist_cote'][1][absc] # cote
+                        d2 = prof_sourc_elem['dist_cote'][0][absc+1] # distance
+                        z2 = prof_sourc_elem['dist_cote'][1][absc+1] # cote
+                        x_z_t = [] # Création d'une liste intermédiaire pour insérer les nouveaux points dans l'ordre du profil
+                        z1_inscrit = False
+                        for p in ref_plani:
+                            if (p == z1 or absc == 0) and not z1_inscrit:
+                                x_z_t.append([d1, z1])
+                                z1_inscrit = True
+                            elif ((z1 < p) and (p < z2)) or ((z1 > p) and (p > z2)) and not(d2 == d1):
+                                # Point existant
+                                if not z1_inscrit:
+                                    x_z_t.append([d1, z1])
+                                    z1_inscrit = True
+                                # Point interpolé
+                                diviseur = max(0.00000001, (d2 - d1))
+                                coef_a = (z2 - z1) / diviseur
+                                coef_b = z1 - d1 * coef_a
+                                dp = (p - coef_b) / coef_a
+                                x_z_t.append([dp, p])
+                            #self.add_log(str(x_z_t))
+                            #self.add_log(str(tri_pt_profils(x_z_t, (d2 > d1))))
+                        x_z += self.tri_pt_profils(x_z_t, (d2 > d1))
+                        if not (len(self.tri_pt_profils(x_z_t, (d2 > d1))) == len(x_z_t)):
+                            self.add_log("Pas la même longueur")
+                        if absc == len((prof_sourc_elem['dist_cote'][0])) - 1: #cas du dernier point du profil
+                            x_z.append([d2, z2])
+                    self.add_log("Après complétude : " + str(x_z))
+                    #self.add_log(prof_sourc_elem['nom'] + " : " + str(x_z))
+                    profils_source[iprof]['mat_planim'] = self.calcul_planim_sh(ref_plani, x_z) # tableau numpy de planimétrage de la section hydraulique, même dimension que ref_plani
+                    self.add_log("Sh planimétrée (" + prof_sourc_elem['nom'] + ") : " + str(profils_source[iprof]['mat_planim']))
+                    #self.add_log(prof_sourc_elem['nom'] + " - Planimétrage créé")
+                    
+                self.add_log("Fin des calculs de planimétrage")
+            
+            # *************************************************************************************************************************
+            # 6- Calcul des sections hydrauliques planimétrées interpolées et du semis de points associé 
+            if len(liste_intersec_profils_intermediaires) > 3:
+                self.add_log("6- Calcul des sections hydrauliques planimétrées interpolées et du semis de points associé ")
+                semis_interp_lit_mineur = QgsProject.instance().mapLayersByName('semis_interp_lit_mineur')[0]
+                semis_interp_lit_mineur.startEditing()
+                pts_lit_mineur = []
+
+                # Création des points MNT le long des berges
+                for pos_curv_rd in np.arange(0, geom_rd.length(), maillage / 2):
+                    point = geom_rd.interpolate(pos_curv_rd)
+                    ident = raster_provider.identify(point.asPoint(), QgsRaster.IdentifyFormatValue).results()
+                    if ident[1]:
+                        new_feat = QgsFeature(semis_interp_lit_mineur.fields())
+                        new_feat.setAttribute('alti', str(ident[1]))
+                        new_feat.setGeometry(point)
+                        pts_lit_mineur.append(new_feat)
+                for pos_curv_rg in np.arange(0, geom_rg.length(), maillage / 2):
+                    point = geom_rg.interpolate(pos_curv_rg)
+                    ident = raster_provider.identify(point.asPoint(), QgsRaster.IdentifyFormatValue).results()
+                    if ident[1]:
+                        new_feat = QgsFeature(semis_interp_lit_mineur.fields())
+                        new_feat.setAttribute('alti', str(ident[1]))
+                        new_feat.setGeometry(point)
+                        pts_lit_mineur.append(new_feat)
+
+                # Construction des formes des nouveaux profils en fonction des sections hydrauliques planimétrées interpolées
+                for index in range(len(nouveaux_profils['profils'])):
+                    trouve, profil_amont, profil_aval = self.profils_amont_aval(nouveaux_profils['absc'][index], profils_source)
+                    if not trouve:
+                        profil_amont = profils_source[ind_premier_profil]
+                        profil_aval = profils_source[ind_dernier_profil]
+                        self.add_log("Profil interpolé à entre premier et dernier profil")
+                    coef_a = (nouveaux_profils['absc'][index] - profil_amont['absc']) / (profil_aval['absc'] - profil_amont['absc'])
+                    pos_rel_branche = nouveaux_profils['profils'][index].geometry().vertexAt(0).distance(liste_intersec_profils_intermediaires[index + 1].asPoint().x(), liste_intersec_profils_intermediaires[index + 1].asPoint().y())
+                    nouveaux_profils['mat_planim'].append(coef_a * (profil_aval['mat_planim'] - profil_amont['mat_planim']) + profil_amont['mat_planim'])
+                    x, z, x_z = self.creation_profils(ref_plani, nouveaux_profils['mat_planim'][index], pos_rel_branche, nouveaux_profils['mnt'][index]['rg'], nouveaux_profils['mnt'][index]['rd'])
+                    nouveaux_profils['profils'][index].setAttribute('x', x)
+                    nouveaux_profils['profils'][index].setAttribute('z', z)
+
+                    # - nouveaux_profils['mnt'][index]['rg / rd'] : valeur du lidar aux extrémités du profil
+                    trace_profil = nouveaux_profils['profils'][index].geometry()
+                    for vertex in x_z:
+                        #self.add_log("Alti : " + str(vertex[1]))
+                        #self.add_log("Distance : " + str(vertex[0]))
+                        new_feat = QgsFeature(semis_interp_lit_mineur.fields())
+                        new_feat.setAttribute('alti', str(vertex[1]))
+                        new_feat.setGeometry(trace_profil.interpolate(vertex[0]))
+                        pts_lit_mineur.append(new_feat)
+                self.add_log("Fin de la création des nouveaux profils et du semis de points associé")
+
+                # Une fois tous les profils intermédiaires construits, on les ajoute à la couche profiles
+                (res, outFeats) = couche_profils.dataProvider().addFeatures(nouveaux_profils['profils'])
+                (res, outFeats) = semis_interp_lit_mineur.dataProvider().addFeatures(pts_lit_mineur)
+                couche_profils.commitChanges()
+                semis_interp_lit_mineur.commitChanges()
 
     def add_log(self, texte):
         self.log += texte + "\n"
@@ -387,6 +652,7 @@ class SHPM:
             self.dlg.pushshp_rivg.clicked.connect(self.charger_rive_gauche)
             self.dlg.pushshp_rivd.clicked.connect(self.charger_rive_droite)
             self.dlg.push_raster_lidar.clicked.connect(self.charger_lidar)
+            self.dlg.pushshp_semis_interp.clicked.connect(self.charger_semis_interp)
             self.dlg.push_calcul_interpolation.clicked.connect(self.calcul_interpolation)
 
 
@@ -486,7 +752,7 @@ class SHPM:
                 flag_rd = True
         return x_tronque, z_tronque
 
-    def calcul_planim_sh(ref_plani, x_z):
+    def calcul_planim_sh(self, ref_plani, x_z):
         # Il faut d'abord s'assurer que x_z est trié dans l'ordre croissant
         ref_sh = np.zeros(np.shape(ref_plani)[0])
         if np.shape(ref_plani)[0] > 1:
